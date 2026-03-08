@@ -45,3 +45,6 @@ For details, check out the [ROADMAP](ROADMAP.md)!
 
 ## Development philosophy
 [Development philosophy](development-philosophy.md)
+
+## LICENSE
+[MIT LICENSE](https://github.com/rii125-125/mana-tool/blob/main/LICENSE-MIT)
