@@ -15,7 +15,7 @@ name = "mn"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.5.60", features = ["derive"] }
+clap = { version = "4.6.0", features = ["derive"] }
 
 anyhow = "1.0"
 
