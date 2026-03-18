@@ -1,13 +1,9 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::env;
-use std::path::Path;
-use anyhow::Result;
-use walkdir::WalkDir;
-use std::collections::HashSet;
-use sha2::{Sha256, Digest};
-use std::io::{self, Read};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManaboxConfig {
@@ -16,144 +12,129 @@ pub struct ManaboxConfig {
     pub select: Vec<String>,
 }
 
-/// Represents a snapshot of the workspace files and their hashes.
 #[derive(Debug)]
 pub struct FileSnapshot {
-    pub files: HashMap<String, String>, // Key: Relative Path, Value: Hash
+    pub files: HashMap<String, String>,
 }
 
 impl ManaboxConfig {
-    /// Loads the .manabox configuration file.
+    const CONFIG_NAME: &'static str = "manabox.yml"; // 名前を変更
+
     pub fn load() -> Result<Self> {
-        let content = fs::read_to_string(".manabox")?;
-        let config: ManaboxConfig = serde_yaml::from_str(&content)?;
+        let content = fs::read_to_string(Self::CONFIG_NAME)
+            .context(format!("Failed to read config file: {}", Self::CONFIG_NAME))?;
+        let config: ManaboxConfig = serde_yaml::from_str(&content)
+            .context("Failed to parse YAML in manabox.yml")?;
         Ok(config)
+    }
+
+    pub fn save_default() -> Result<()> {
+        let default_content = r#"file: ["target/", "node_modules/"]
+must: ["Cargo.toml", "Cargo.lock"]
+select: ["README.md"]
+"#;
+        fs::write(Self::CONFIG_NAME, default_content)
+            .context("Failed to create manabox.yml")
     }
 }
 
-/// Initializes the mana box environment.
-/// Creates .mana directory structure and a default .manabox file.
-pub fn init_mana(name: &Option<String>) -> Result<()> {
-    // 1. Determine the box name
-    let box_name = name.clone().unwrap_or_else(|| {
-        env::current_dir()
-            .expect("Failed to get current directory")
-            .file_name()
-            .expect("Failed to get directory name")
-            .to_string_lossy()
-            .into_owned()
-    });
-
-    // 2. Create .mana directory (with existence check)
-    if Path::new(".mana").exists() {
-        println!("⚠️ mana: A box (.mana) already exists.");
-    } else {
+pub fn init_mana(_name: &Option<String>) -> Result<()> {
+    // 1. ディレクトリ作成
+    if !Path::new(".mana").exists() {
         fs::create_dir_all(".mana/objects")?;
         fs::create_dir_all(".mana/storage/main")?;
         fs::write(".mana/now", "main")?;
-        fs::write(".mana/objects/main", "none")?;
-        println!("✨ create box \"{}\".", box_name);
+        println!("✨ Created .mana directory.");
     }
 
-    // 3. Create .manabox file (with overwrite protection)
-    if Path::new(".manabox").exists() {
-        println!("✋ mana: Since '.manabox' already exists, creation was skipped.");
+    // 2. manabox.yml 作成
+    if !Path::new(ManaboxConfig::CONFIG_NAME).exists() {
+        ManaboxConfig::save_default()?;
+        println!("📄 Created {}", ManaboxConfig::CONFIG_NAME);
     } else {
-        let default_manabox = r#"file: [
-    "node_modules/",
-    "target/",
-    "out/",
-    ".vscode/",
-    "dist/",
-    "build/",
-    "__pycache__/",
-    ".env",
-    ".DS_Store",
-    "Thumbs.db",
-    ".class",
-    ".log",
-]
-must: [
-    "package.json",
-    "package-lock.json",
-    "Cargo.toml",
-    "Cargo.lock",
-]
-select: [
-    "README.md",
-]
-"#;
-        fs::write(".manabox", default_manabox)?;
-        println!("📄 A new '.manabox' has been created.");
+        println!("✋ {} already exists.", ManaboxConfig::CONFIG_NAME);
     }
-
     Ok(())
 }
 
-// Add this to your existing ManaboxConfig struct or as a standalone function
-/// Scans the workspace and returns a FileSnapshot containing hashes of all relevant files.
-pub fn scan_workspace(config: &ManaboxConfig) -> Result<FileSnapshot> {
-    println!("🔍 Scanning and hashing files...");
-    let mut files = HashMap::new();
+pub fn calculate_hash(path: &Path) -> Result<String> {
+    let mut content = fs::read(path)
+        .context(format!("Failed to read file: {:?}", path))?;
 
-    let ignore_set: HashSet<String> = config.file.iter().map(|s| s.trim_end_matches('/').to_string()).collect();
-
-    for entry in WalkDir::new(".")
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            name != ".mana" && !ignore_set.contains(&name.to_string())
-        })
-        .filter_map(|e| e.ok()) 
-    {
-        let path = entry.path();
-        if path.is_file() {
-            // Calculate the hash for each file found
-            let hash = calculate_hash(path)?;
-            let path_str = path.to_string_lossy().to_string();
-            files.insert(path_str, hash);
+    // 末尾の空白・改行をトリミング（バイナリのまま処理）
+    while let Some(&last) = content.last() {
+        if last == b'\n' || last == b'\r' || last == b' ' {
+            content.pop();
+        } else {
+            break;
         }
     }
 
-    Ok(FileSnapshot { files })
-}
-
-/// Calculates the SHA-256 hash of a file.
-/// This is the "fingerprint" of the file content.
-pub fn calculate_hash(path: &std::path::Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 1024]; // Read in chunks for efficiency
-
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 { break; }
-        hasher.update(&buffer[..count]);
+    if content.is_empty() {
+        // 空ファイルの場合は特定のハッシュではなくエラーにする選択もアリだが、
+        // ここでは空文字のハッシュを許容せず、明示的に空であることを返すかエラーにする
+        anyhow::bail!("File content is empty (or only whitespace): {:?}", path);
     }
 
+    let mut hasher = Sha256::new();
+    hasher.update(&content);
     Ok(hex::encode(hasher.finalize()))
+}
+
+pub fn scan_workspace(config: &ManaboxConfig) -> Result<FileSnapshot> {
+    let mut files = HashMap::new();
+    for file_name in &config.must {
+        let path = Path::new(file_name);
+        if path.exists() {
+            let hash = calculate_hash(path)?;
+            files.insert(file_name.clone(), hash);
+        }
+    }
+    Ok(FileSnapshot { files })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
+    use std::fs;
 
     #[test]
-    fn test_calculate_hash() -> anyhow::Result<()> {
-        // 1. Create a temporary file
-        let mut tmpfile = NamedTempFile::new()?;
-        write!(tmpfile, "hello mana")?;
-        tmpfile.flush()?;
+    fn test_scan_workspace_basic() -> Result<()> {
+        // 1. 一時ディレクトリを作成
+        let temp = tempfile::tempdir()?;
+        let temp_path = temp.path();
 
-        // 2. Calculate hash
-        let hash = calculate_hash(tmpfile.path())?;
+        // 2. 一時ディレクトリの中にテストファイルを作る (絶対パスで管理)
+        let file_name = "hello.txt";
+        let file_full_path = temp_path.join(file_name);
+        fs::write(&file_full_path, b"hello mana")?;
 
-        // 3. SHA-256 of "hello mana"
-        // echo -n "hello mana" | shasum -a 256
-        let expected = "274a7732296c09819970921a8d0034606f2e8f19293114d2e057388716399676";
-        assert_eq!(hash, expected);
+        // 3. 設定ファイル。ここには「ファイル名」だけを入れる
+        let config = ManaboxConfig {
+            file: vec![],
+            must: vec![file_name.to_string()],
+            select: vec![],
+        };
+
+        // 4. スキャン実行。
+        // ※scan_workspaceがカレントディレクトリを見る仕様なら、
+        // 関数内で結合するか、一時的にディレクトリを移動する
+        let snapshot = {
+            let previous_dir = std::env::current_dir()?;
+            std::env::set_current_dir(temp_path)?;
+            let res = scan_workspace(&config);
+            std::env::set_current_dir(previous_dir)?; // 元に戻す
+            res?
+        };
+
+        // 5. 検証
+        // ここで .get().expect() を使うことで、1548... が捏造される隙を与えない
+        let actual_hash = snapshot.files.get(file_name)
+            .context(format!("File [{}] not found in snapshot. Keys: {:?}", file_name, snapshot.files.keys()))?;
+
+        let expected_hash = "274a7732296c09819970921a8d0034606f2e8f19293114d2e057388716399676";
+        assert_eq!(actual_hash, expected_hash);
+
         Ok(())
     }
 }
